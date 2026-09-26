@@ -5,21 +5,21 @@ from pathlib import Path
 from collections import defaultdict, Counter
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_DIR.parent.parent / "dataset" / "train"
+DATA_DIR = PROJECT_DIR.parent.parent / "dataset" / "test"
 OUTPUT_DIR = PROJECT_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-SRC1 = DATA_DIR / "train_source1.tsv"
-SRC2 = DATA_DIR / "train_source2.tsv"
-SRC3 = DATA_DIR / "train_source3.tsv"
+SRC1 = DATA_DIR / "test_source1.tsv"
+SRC2 = DATA_DIR / "test_source2.tsv"
+SRC3 = DATA_DIR / "test_source3.tsv"
 
-MAX_POSTING_LIST = 2000     # tokens appearing in more records than this are dropped (too common, no signal)
-MAX_TOKENS_PER_ENTITY = 12  # only score using each entity's rarest N tokens (speed cap)
+MAX_POSTING_LIST = 2000
+MAX_TOKENS_PER_ENTITY = 12
 MIN_TOKEN_LEN = 2
 
-RELATIVE_THRESHOLD = 0.7    # keep candidates scoring >= 70% of the top score
-MAX_CANDIDATES = 10         # hard cap even if many pass the relative threshold
-MIN_CANDIDATES = 1          # always keep at least the top candidate if any exist
+RELATIVE_THRESHOLD = 0.7
+MAX_CANDIDATES = 10
+MIN_CANDIDATES = 1
 
 STOPWORDS = {
     "the", "and", "of", "inc", "incorporated", "corp", "corporation", "ltd",
@@ -38,7 +38,6 @@ def tokenize(text):
 
 
 def iter_records(path):
-    """Yield (entity_id, token_set) combining name + address. One row at a time."""
     with open(path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
         for row in reader:
@@ -48,7 +47,6 @@ def iter_records(path):
 
 
 def run_blocking(pool_paths, query_path, output_path):
-    # ---------- Pass 1: document frequency ----------
     print("Pass 1: counting token frequencies...")
     doc_freq = Counter()
     total_docs = 0
@@ -69,7 +67,6 @@ def run_blocking(pool_paths, query_path, output_path):
     idf = {t: math.log(total_docs / (1 + doc_freq[t])) for t in good_tokens}
     del doc_freq
 
-    # ---------- Pass 2: inverted index ----------
     print("Pass 2: building inverted index...")
     inverted = defaultdict(list)
 
@@ -85,7 +82,6 @@ def run_blocking(pool_paths, query_path, output_path):
 
     print(f"Inverted index built: {len(inverted):,} tokens")
 
-    # ---------- Generate candidates (adaptive cutoff) ----------
     print("Generating candidates...")
     total_candidates_written = 0
 
@@ -133,5 +129,5 @@ if __name__ == "__main__":
     run_blocking(
         pool_paths=[SRC2, SRC3],
         query_path=SRC1,
-        output_path=OUTPUT_DIR / "candidate_pairs.tsv",
+        output_path=OUTPUT_DIR / "candidate_pairs.tsv",   # this IS your submission file
     )

@@ -1,27 +1,30 @@
-import csv
-import re
+import pandas as pd
+import lightgbm as lgb
 import sqlite3
+import re
+import csv
 from pathlib import Path
-
-try:
-    from rapidfuzz import fuzz
-except ImportError:
-    raise SystemExit("Run: pip install rapidfuzz")
+from rapidfuzz import fuzz
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_DIR.parent.parent / "dataset" / "train"
+DATA_DIR = PROJECT_DIR.parent.parent / "dataset" / "test"
 OUTPUT_DIR = PROJECT_DIR / "output"
 
-SRC1 = DATA_DIR / "train_source1.tsv"
-SRC2 = DATA_DIR / "train_source2.tsv"
-SRC3 = DATA_DIR / "train_source3.tsv"
-GROUND_TRUTH = DATA_DIR / "train_ground_truth.tsv"
+SRC1 = DATA_DIR / "test_source1.tsv"
+SRC2 = DATA_DIR / "test_source2.tsv"
+SRC3 = DATA_DIR / "test_source3.tsv"
 CANDIDATES = OUTPUT_DIR / "candidate_pairs.tsv"
-FEATURES_OUT = OUTPUT_DIR / "features.csv"
-DB_PATH = OUTPUT_DIR / "entities.sqlite"
+MODEL_PATH = OUTPUT_DIR / "matcher_model.txt"
+DB_PATH = OUTPUT_DIR / "entities_test.sqlite"   # separate DB for test data
+RESULTS_OUT = OUTPUT_DIR / "matching_results.tsv"
+
+THRESHOLD = 0.7
+FEATURE_COLS = [
+    "name_jaccard", "name_fuzz_ratio", "name_token_sort_ratio",
+    "addr_jaccard", "addr_fuzz_ratio", "country_match",
+]
 
 TOKEN_RE = re.compile(r"[^a-z0-9\s]")
-BATCH_SIZE = 500   # SQLite IN() clause batch size
 
 
 def normalize(text):
@@ -41,12 +44,8 @@ def jaccard(a, b):
     return inter / union if union else 0.0
 
 
-# ============================================================
-# STEP 1: build the SQLite DB once (skip if already built)
-# ============================================================
-
 def build_db():
-    print("Building entity database (one-time step)...")
+    print("Building test entity database...")
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("DROP TABLE IF EXISTS records")
@@ -71,60 +70,33 @@ def build_db():
                 country = (row.get("country") or "").strip().lower()
                 batch.append((row["entity_id"], name, addr, country))
                 n += 1
-
                 if len(batch) >= 5000:
-                    cur.executemany(
-                        "INSERT OR REPLACE INTO records VALUES (?, ?, ?, ?)", batch
-                    )
+                    cur.executemany("INSERT OR REPLACE INTO records VALUES (?, ?, ?, ?)", batch)
                     batch = []
-
                 if n % 1_000_000 == 0:
                     print(f"    {n:,} rows")
-
         if batch:
-            cur.executemany(
-                "INSERT OR REPLACE INTO records VALUES (?, ?, ?, ?)", batch
-            )
+            cur.executemany("INSERT OR REPLACE INTO records VALUES (?, ?, ?, ?)", batch)
 
     conn.commit()
     conn.close()
-    print("Database built.")
+    print("Test database built.")
 
 
 if not DB_PATH.exists():
     build_db()
 else:
-    print("Using existing entity database.")
+    print("Using existing test entity database.")
 
-
-# ============================================================
-# STEP 2: load ground truth into memory (small, ~7.6M tuples — fine)
-# ============================================================
-
-print("Loading ground truth...")
-gt_pairs = set()
-with open(GROUND_TRUTH, encoding="utf-8", newline="") as f:
-    reader = csv.DictReader(f, delimiter="\t")
-    for row in reader:
-        if row["matched_entity_ids"].strip():
-            for m in row["matched_entity_ids"].split(","):
-                m = m.strip()
-                if m:
-                    gt_pairs.add((row["source1_entity_id"], m))
-print(f"Ground-truth positive pairs: {len(gt_pairs):,}")
-
-
-# ============================================================
-# STEP 3: stream candidate_pairs.tsv in batches, look up records
-# from SQLite per batch, compute features, write out
-# ============================================================
+print("Loading model...")
+model = lgb.Booster(model_file=str(MODEL_PATH))
 
 conn = sqlite3.connect(DB_PATH)
 cur = conn.cursor()
+BATCH_SIZE = 500
 
 
 def fetch_records(entity_ids):
-    """Fetch a dict of entity_id -> (name, addr, country) for a batch of IDs."""
     result = {}
     ids = list(entity_ids)
     for i in range(0, len(ids), BATCH_SIZE):
@@ -139,28 +111,25 @@ def fetch_records(entity_ids):
     return result
 
 
-print("Computing features...")
+all_s1_ids = []
+with open(SRC1, encoding="utf-8", newline="") as f:
+    reader = csv.DictReader(f, delimiter="\t")
+    for row in reader:
+        all_s1_ids.append(row["entity_id"])
 
-with open(CANDIDATES, encoding="utf-8", newline="") as in_f, \
-     open(FEATURES_OUT, "w", encoding="utf-8", newline="") as out_f:
+print(f"Total test S1 entities: {len(all_s1_ids):,}")
 
+results = {}
+
+print("Scoring candidates and generating final matches...")
+
+with open(CANDIDATES, encoding="utf-8", newline="") as in_f:
     reader = csv.DictReader(in_f, delimiter="\t")
-    writer = csv.writer(out_f)
-    writer.writerow([
-        "source1_entity_id", "candidate_entity_id",
-        "name_jaccard", "name_fuzz_ratio", "name_token_sort_ratio",
-        "addr_jaccard", "addr_fuzz_ratio",
-        "country_match",
-        "label",
-    ])
-
     rows_batch = []
-    BATCH_ROWS = 2000  # how many S1 entities to process per DB round-trip
+    BATCH_ROWS = 2000
     n = 0
-    pos_count = 0
 
     def process_batch(rows_batch):
-        global pos_count
         needed_ids = set()
         for s1_id, cand_ids in rows_batch:
             needed_ids.add(s1_id)
@@ -170,11 +139,13 @@ with open(CANDIDATES, encoding="utf-8", newline="") as in_f, \
 
         for s1_id, cand_ids in rows_batch:
             if s1_id not in records:
+                results[s1_id] = []
                 continue
             s1_name, s1_addr, s1_country = records[s1_id]
             s1_name_tok = set(s1_name.split())
             s1_addr_tok = set(s1_addr.split())
 
+            feats, valid_cands = [], []
             for cand_id in cand_ids:
                 if cand_id not in records:
                     continue
@@ -188,27 +159,25 @@ with open(CANDIDATES, encoding="utf-8", newline="") as in_f, \
                 addr_jac = jaccard(s1_addr_tok, c_addr_tok)
                 addr_fuzz = fuzz.ratio(s1_addr, c_addr) / 100.0
                 country_match = 1 if s1_country and s1_country == c_country else 0
-                label = 1 if (s1_id, cand_id) in gt_pairs else 0
-                pos_count += label
 
-                writer.writerow([
-                    s1_id, cand_id,
-                    round(name_jac, 4), round(name_fuzz, 4), round(name_sort, 4),
-                    round(addr_jac, 4), round(addr_fuzz, 4),
-                    country_match, label,
-                ])
+                feats.append([name_jac, name_fuzz, name_sort, addr_jac, addr_fuzz, country_match])
+                valid_cands.append(cand_id)
+
+            if feats:
+                X = pd.DataFrame(feats, columns=FEATURE_COLS)
+                probs = model.predict(X)
+                matched = [cid for cid, p in zip(valid_cands, probs) if p >= THRESHOLD]
+                results[s1_id] = matched
+            else:
+                results[s1_id] = []
 
     for row in reader:
-        if not row["candidate_entity_ids"].strip():
-            continue
         cand_ids = [c.strip() for c in row["candidate_entity_ids"].split(",") if c.strip()]
         rows_batch.append((row["source1_entity_id"], cand_ids))
         n += 1
-
         if len(rows_batch) >= BATCH_ROWS:
             process_batch(rows_batch)
             rows_batch = []
-
         if n % 200_000 == 0:
             print(f"  processed {n:,} S1 entities")
 
@@ -216,5 +185,14 @@ with open(CANDIDATES, encoding="utf-8", newline="") as in_f, \
         process_batch(rows_batch)
 
 conn.close()
-print(f"Done -> {FEATURES_OUT}")
-print(f"Positive-labeled pairs: {pos_count:,}")
+
+print("Writing matching_results.tsv...")
+with open(RESULTS_OUT, "w", encoding="utf-8", newline="") as out_f:
+    writer = csv.writer(out_f, delimiter="\t")
+    writer.writerow(["source1_entity_id", "matched_entity_ids"])
+    for s1_id in all_s1_ids:
+        matched = results.get(s1_id, [])
+        writer.writerow([s1_id, ",".join(matched)])
+
+print(f"Done -> {RESULTS_OUT}")
+print(f"Entities with at least one match: {sum(1 for v in results.values() if v):,}")
